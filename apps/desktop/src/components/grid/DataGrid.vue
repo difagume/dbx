@@ -275,7 +275,6 @@ const multiRowTranspose = computed(() => settingsStore.editorSettings.dataGridMu
 const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHideNullColumns);
 const booleanCellsUseCheckbox = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode === "checkbox");
 const booleanDisplayMode = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode);
-const setBooleanDisplayMode = (mode: "checkbox" | "dropdown") => settingsStore.updateEditorSettings({ dataGridBooleanDisplayMode: mode });
 const { isDark, themePalette } = useTheme();
 const { toast } = useToast();
 // 外键单元格跳转复用导航入口；对话框引用传 stub（同 AiAssistant 模式）
@@ -3306,7 +3305,8 @@ function booleanCellChecked(value: unknown): boolean {
 function cycleBooleanGridCell(item: RowItem | undefined, actualColIdx: number, event?: MouseEvent) {
   if (!item || !isBooleanGridCell(item, actualColIdx) || !canEditCellItem(item, actualColIdx)) return;
   event?.stopPropagation();
-  applyCellValue(item.id, actualColIdx, nextBooleanCellValue(item.data[actualColIdx], isBooleanGridColumnNullable(actualColIdx)));
+  const next = nextBooleanCellValue(item.data[actualColIdx], isBooleanGridColumnNullable(actualColIdx));
+  applyCellValue(item.id, actualColIdx, next === null ? null : next ? "true" : "false");
 }
 
 function cellEditInputModeForColumn(columnIndex: number): "decimal" | "numeric" | undefined {
@@ -9731,8 +9731,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
                         'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
                         'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
-                        'cursor-text hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx) && !(booleanCellsUseCheckbox.value && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null),
-                        'cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && booleanCellsUseCheckbox.value && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx),
+                        'cursor-text hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx) && !(booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null),
+                        'cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx),
                         'line-through': item.isDeleted,
                         'overflow-visible z-20 border-r-transparent': editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx,
                         'overflow-hidden': !(editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx),
@@ -9810,7 +9810,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         <template v-if="draftCellPlaceholder(item, col.actualColIdx)">
                           <span class="text-muted-foreground/70 italic">{{ draftCellPlaceholder(item, col.actualColIdx) }}</span>
                         </template>
-                        <template v-else-if="booleanCellsUseCheckbox.value && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx)">
+                        <template v-else-if="booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx)">
                           <div class="flex h-full items-center justify-center">
                             <input
                               type="checkbox"
