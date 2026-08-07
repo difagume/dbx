@@ -510,7 +510,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions) {
       const isBooleanCell = columnIsBoolean?.(actualColIdx) === true && isBooleanCellValue(value);
       const isRightAlign = columnAligns?.[visibleColIdx] === "right";
       const isEditingThisCell = editingCell?.rowId === item.id && editingCell.col === actualColIdx;
-      const isBooleanNullCell = isBooleanCell && value === null && !isEditingThisCell;
+      const isBooleanNullCell = booleanDisplayMode === "checkbox" && isBooleanCell && value === null && !isEditingThisCell;
       const shouldRenderBooleanCheckbox = booleanDisplayMode === "checkbox" && isBooleanCell && value !== null && !isEditingThisCell;
       ctx.textAlign = isBooleanNullCell ? "center" : isRightAlign ? "right" : "left";
       ctx.fillStyle = value === null ? theme.mutedForeground : theme.foreground;
