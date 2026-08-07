@@ -93,14 +93,17 @@ test("indexes table metadata once and resolves source-column aliases", () => {
   assert.equal(resolved[2], undefined);
 });
 
-test("uses the enum editor for boolean cells without checkbox rendering or click cycling", () => {
+test("keeps the enum editor as the default boolean edit path and gates checkbox interaction behind the checkbox display mode", () => {
   const gridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
   const rendererSource = readFileSync("apps/desktop/src/lib/dataGrid/canvasDataGridRenderer.ts", "utf8");
 
   assert.match(gridSource, /v-else-if="isBooleanGridCell\([^\n]+"[\s\S]*?v-model="booleanEditorModelValue"[\s\S]*?:values="BOOLEAN_CELL_EDITOR_VALUES"/);
   assert.match(gridSource, /@commit="commitBooleanGridEdit"/);
-  assert.doesNotMatch(gridSource, /cycleBooleanCellValue|tryCycleBooleanCheckboxOnCanvasMouseDown|booleanCellChecked/);
-  assert.doesNotMatch(rendererSource, /drawBooleanCheckbox|BOOLEAN_CHECKBOX_SIZE|columnIsBoolean/);
+  // The editor-side cycle helper the old checkbox implementation depended on stays removed.
+  assert.doesNotMatch(gridSource, /cycleBooleanCellValue/);
+  // Checkbox rendering and click cycling only exist behind the checkbox display mode.
+  assert.match(gridSource, /booleanCellsUseCheckbox\.value/);
+  assert.match(rendererSource, /booleanDisplayMode === "checkbox"/);
 });
 
 test("uses the indexed metadata lookup in grid hot paths", () => {
