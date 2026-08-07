@@ -106,6 +106,18 @@ test("keeps the enum editor as the default boolean edit path and gates checkbox 
   assert.match(rendererSource, /booleanDisplayMode === "checkbox"/);
 });
 
+test("DOM checkbox mode renders a clickable placeholder for null boolean cells so they can be cycled like canvas", () => {
+  const gridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
+  // Canvas surfaces null booleans via booleanNullTextHitFromCanvasEvent (click the NULL text to cycle).
+  // The DOM path must offer the same affordance: a null boolean cell in checkbox mode renders its NULL
+  // text with a click handler that triggers cycleBooleanGridCell, instead of falling through to the
+  // static v-else text (which cannot be cycled and is short-circuited by onDomCellDblClick).
+  const domCellBranch = gridSource.match(/<template v-else-if="booleanCellsUseCheckbox && isBooleanGridCell\([^\n]+=== null[\s\S]*?cycleBooleanGridCell/);
+  assert.ok(domCellBranch, "DOM checkbox mode must render a clickable cycle placeholder for null boolean cells");
+  assert.match(domCellBranch![0], /@click\.stop="cycleBooleanGridCell/);
+  assert.match(domCellBranch![0], /text-muted-foreground/);
+});
+
 test("uses the indexed metadata lookup in grid hot paths", () => {
   const source = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
   const start = source.indexOf("function tableColumnForGridColumn");
