@@ -269,7 +269,7 @@ test("rerun total-count visibility comes from the shared rule and triggers the m
   assert.match(rerunComputed, /canCalculateTotalRowCount: canCalculateTotalRowCount\.value/);
   assert.match(rerunComputed, /displayedTotalRowCount: displayedTotalRowCount\.value/);
   assert.match(rerunComputed, /totalRowCountIsExact: totalRowCountIsExact\.value/);
-  const rerunButton = source.match(/<button v-else-if="showRerunTotalCountAction"[\s\S]*?<\/button>/)?.[0] ?? "";
+  const rerunButton = source.match(/<button\s+v-else-if="showRerunTotalCountAction"[\s\S]*?<\/button>/)?.[0] ?? "";
   assert.match(rerunButton, /@click="calculateTotalRowCount"/);
 });
 
