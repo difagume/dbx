@@ -3786,8 +3786,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
              ORDER BY t.oid, i.relname"
 }
 
-/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)` since
-/// this query is `information_schema`-based rather than oid-based.
+/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)`.
 pub async fn list_foreign_keys_for_relations(
     pool: &Pool,
     relations: &[(String, String)],
@@ -3818,8 +3817,8 @@ async fn list_foreign_keys_for_relations_with_sql(
             ref_schema: Some(pg_row_try_string(row, 4)),
             ref_table: pg_row_try_string(row, 5),
             ref_column: pg_row_try_string(row, 6),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 7)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 8)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 7)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 8)),
         });
     }
     Ok(result)
@@ -3831,26 +3830,25 @@ fn postgres_foreign_keys_for_relations_query_tiers() -> [&'static str; 2] {
 
 fn postgres_foreign_keys_for_relations_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
-     fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
      FROM unnest($1::text[], $2::text[]) AS rel(rel_schema, rel_table) \
-     JOIN information_schema.table_constraints tc \
-       ON tc.table_schema = rel.rel_schema AND tc.table_name = rel.rel_table \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-     ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
 
 // PostgreSQL 9.3 and older only accept one array argument to unnest(). Pair
@@ -3858,29 +3856,28 @@ fn postgres_foreign_keys_for_relations_sql() -> &'static str {
 // one bounded query and preserves each relation tuple's position.
 fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
-     fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
      FROM ( \
        SELECT ($1::text[])[rel.i] AS rel_schema, ($2::text[])[rel.i] AS rel_table \
        FROM generate_subscripts($1::text[], 1) AS rel(i) \
      ) AS rel \
-     JOIN information_schema.table_constraints tc \
-       ON tc.table_schema = rel.rel_schema AND tc.table_name = rel.rel_table \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-     ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
 
 /// Batched sibling of `get_table_comment`.
@@ -4356,7 +4353,7 @@ fn postgres_constraint_type_label(contype: &str) -> String {
 }
 
 /// Normalize a `confupdtype`/`confdeltype` letter to an `information_schema`
-/// style referential-action label, mirroring `postgres_foreign_key_action`.
+/// style referential-action label.
 fn postgres_fk_action_label(action: Option<String>) -> Option<String> {
     action
         .as_deref()
@@ -7405,34 +7402,24 @@ pub async fn list_invalid_indexes(pool: &Pool, schema: &str, table: &str) -> Res
 }
 
 fn postgres_foreign_keys_sql() -> &'static str {
-    "SELECT fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
-     FROM information_schema.table_constraints tc \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-       AND fk.table_schema = $1 AND fk.table_name = $2 \
-     ORDER BY fk.constraint_name, fk.ordinal_position"
-}
-
-fn postgres_foreign_key_action(value: String) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
 }
 
 pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
@@ -7449,8 +7436,8 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
             ref_schema: Some(pg_row_try_string(row, 2)),
             ref_table: pg_row_try_string(row, 3),
             ref_column: pg_row_try_string(row, 4),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 5)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 6)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 5)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 6)),
         })
         .collect())
 }
@@ -9805,9 +9792,17 @@ mod tests {
     fn postgres_foreign_keys_sql_selects_referential_actions() {
         let sql = postgres_foreign_keys_sql();
 
-        assert!(sql.contains("rc.update_rule AS on_update"));
-        assert!(sql.contains("rc.delete_rule AS on_delete"));
-        assert!(sql.contains("information_schema.referential_constraints rc"));
+        assert!(sql.contains("pg_catalog.pg_constraint"));
+        assert!(sql.contains("con.confupdtype::text AS on_update_raw"));
+        assert!(sql.contains("con.confdeltype::text AS on_delete_raw"));
+        assert!(sql.contains("confdeltype"));
+        assert!(sql.contains("ref_n.nspname"));
+        assert!(sql.contains("unnest(con.conkey) WITH ORDINALITY"));
+        assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(sql.contains("con.contype = 'f'"));
+        assert!(sql.contains("NOT a.attisdropped"));
+        assert!(sql.contains("JOIN LATERAL"));
+        assert!(!sql.contains("information_schema"));
     }
 
     #[test]
@@ -9828,14 +9823,6 @@ mod tests {
         assert!(compat_sql.contains("pg_catalog.pg_inherits"));
         assert!(compat_sql.contains("con.contype = 'f'"));
         assert!(compat_sql.contains("ORDER BY table_name, ref_table"));
-    }
-
-    #[test]
-    fn postgres_foreign_key_action_keeps_non_empty_action() {
-        assert_eq!(postgres_foreign_key_action("CASCADE".to_string()), Some("CASCADE".to_string()));
-        assert_eq!(postgres_foreign_key_action(" SET NULL ".to_string()), Some("SET NULL".to_string()));
-        assert_eq!(postgres_foreign_key_action("".to_string()), None);
-        assert_eq!(postgres_foreign_key_action("  ".to_string()), None);
     }
 
     #[test]
@@ -10855,14 +10842,24 @@ mod tests {
         assert_eq!(modern_sql, postgres_foreign_keys_for_relations_sql());
         assert!(modern_sql.contains("unnest($1::text[], $2::text[])"));
         assert!(!modern_sql.contains("generate_subscripts"));
+        assert!(modern_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!modern_sql.contains("information_schema"));
+        assert!(modern_sql.contains("con.confupdtype::text"));
+        assert!(modern_sql.contains("confdeltype"));
+        assert!(modern_sql.contains("con.contype = 'f'"));
+        assert!(modern_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
 
         let compat_sql = tiers[1];
         assert_eq!(compat_sql, postgres_foreign_keys_for_relations_compat_sql());
-        assert!(!compat_sql.contains("unnest("));
+        assert!(!compat_sql.contains("unnest($1::text[]"));
         assert!(compat_sql.contains("generate_subscripts($1::text[], 1)"));
         assert!(compat_sql.contains("($1::text[])[rel.i] AS rel_schema"));
         assert!(compat_sql.contains("($2::text[])[rel.i] AS rel_table"));
-        assert!(compat_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"));
+        assert!(compat_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!compat_sql.contains("information_schema"));
+        assert!(compat_sql.contains("confdeltype"));
+        assert!(compat_sql.contains("con.contype = 'f'"));
+        assert!(compat_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
     }
 
     #[test]
