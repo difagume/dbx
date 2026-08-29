@@ -7481,7 +7481,11 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
 /// older OpenGauss releases may reject WITH ORDINALITY or decode catalog arrays
 /// differently on the wire, so read conkey/confkey as text and resolve the
 /// attribute numbers in Rust.
-pub async fn list_opengauss_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+pub async fn list_opengauss_foreign_keys(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let rows = postgres_query_cached(&client, opengauss_foreign_keys_sql(), &[&schema, &table])
