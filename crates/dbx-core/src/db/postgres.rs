@@ -3854,6 +3854,9 @@ fn postgres_foreign_keys_for_relations_sql() -> &'static str {
 // PostgreSQL 9.3 and older only accept one array argument to unnest(). Pair
 // the schema/table arrays through their shared subscript so the fallback stays
 // one bounded query and preserves each relation tuple's position.
+// WITH ORDINALITY is equally unavailable before 9.4, so pair conkey/confkey
+// positions with generate_series over the array length plus plain subscripts —
+// the same pre-9.4 technique the index compat SQL relies on.
 fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
      con.conname AS constraint_name, \
@@ -3872,10 +3875,9 @@ fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
      JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
-     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
-     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
-     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
-     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
      WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
      ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
@@ -7422,12 +7424,36 @@ fn postgres_foreign_keys_sql() -> &'static str {
      ORDER BY con.conname, fk.ord"
 }
 
-pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+// Pre-9.4 sibling of `postgres_foreign_keys_sql`: WITH ORDINALITY requires
+// PostgreSQL 9.4, so pair conkey/confkey positions with generate_series over
+// the array length plus plain subscripts.
+fn postgres_foreign_keys_compat_sql() -> &'static str {
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
+}
 
+async fn list_foreign_keys_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &'static str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, tokio_postgres::Error> {
+    let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
     Ok(rows
         .iter()
         .map(|row| ForeignKeyInfo {
@@ -7440,6 +7466,84 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
             on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 6)),
         })
         .collect())
+}
+
+pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let tiers = [postgres_foreign_keys_sql(), postgres_foreign_keys_compat_sql()];
+    query_with_compat_fallback("list_foreign_keys", &tiers, |sql| {
+        list_foreign_keys_with_sql(&client, sql, schema, table)
+    })
+    .await
+}
+
+/// OpenGauss-safe foreign key metadata. Mirrors `list_opengauss_constraints`:
+/// older OpenGauss releases may reject WITH ORDINALITY or decode catalog arrays
+/// differently on the wire, so read conkey/confkey as text and resolve the
+/// attribute numbers in Rust.
+pub async fn list_opengauss_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, opengauss_foreign_keys_sql(), &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let local_relation_oid =
+        pg_row_try_u32(&rows[0], 7).ok_or("OpenGauss foreign key metadata did not return a local relation OID")?;
+    let local_attributes = opengauss_relation_attributes(&client, local_relation_oid).await?;
+    let mut referenced_attributes: HashMap<u32, HashMap<i16, String>> = HashMap::new();
+    let mut result = Vec::new();
+
+    for row in &rows {
+        let name = pg_row_try_string(row, 0);
+        let column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 3))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} columns: {error}"))?;
+        let ref_column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 4))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} referenced columns: {error}"))?;
+        let ref_schema = pg_row_try_string(row, 1);
+        let ref_table = pg_row_try_string(row, 2);
+        let on_update = postgres_fk_action_label(pg_row_try_optional_text(row, 5));
+        let on_delete = postgres_fk_action_label(pg_row_try_optional_text(row, 6));
+        let Some(referenced_relation_oid) = pg_row_try_u32(row, 8).filter(|oid| *oid != 0) else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = referenced_attributes.entry(referenced_relation_oid) {
+            entry.insert(opengauss_relation_attributes(&client, referenced_relation_oid).await?);
+        }
+        let ref_attributes = referenced_attributes.get(&referenced_relation_oid).unwrap();
+        for (fk_number, pk_number) in column_numbers.iter().zip(ref_column_numbers.iter()) {
+            let Some(column) = local_attributes.get(fk_number) else { continue };
+            let Some(ref_column) = ref_attributes.get(pk_number) else { continue };
+            result.push(ForeignKeyInfo {
+                name: name.clone(),
+                column: column.clone(),
+                ref_schema: Some(ref_schema.clone()),
+                ref_table: ref_table.clone(),
+                ref_column: ref_column.clone(),
+                on_update: on_update.clone(),
+                on_delete: on_delete.clone(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn opengauss_foreign_keys_sql() -> &'static str {
+    "SELECT con.conname, \
+            ref_n.nspname, ref_c.relname, \
+            COALESCE(con.conkey::text, ''), COALESCE(con.confkey::text, ''), \
+            con.confupdtype::text, con.confdeltype::text, \
+            con.conrelid::oid, con.confrelid::oid \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname"
 }
 
 fn postgres_table_dependencies_sql() -> &'static str {
@@ -9803,6 +9907,29 @@ mod tests {
         assert!(sql.contains("NOT a.attisdropped"));
         assert!(sql.contains("JOIN LATERAL"));
         assert!(!sql.contains("information_schema"));
+    }
+
+    #[test]
+    fn postgres_foreign_key_metadata_has_legacy_catalog_fallback() {
+        // The compat tiers exist for pre-9.4 servers, so they must avoid WITH
+        // ORDINALITY (a 9.4 feature) and pair conkey/confkey positions through
+        // generate_series + plain array subscripts instead, mirroring the index
+        // compat invariant.
+        for compat_sql in [postgres_foreign_keys_compat_sql(), postgres_foreign_keys_for_relations_compat_sql()] {
+            assert!(!compat_sql.contains("WITH ORDINALITY"));
+            assert!(compat_sql.contains("generate_series"));
+            assert!(compat_sql.contains("array_length(con.conkey, 1)"));
+            assert!(compat_sql.contains("con.contype = 'f'"));
+            assert!(compat_sql.contains("NOT a.attisdropped"));
+            assert!(!compat_sql.contains("information_schema"));
+        }
+        // OpenGauss resolves attribute numbers in Rust, so its SQL must not
+        // expand catalog arrays at all.
+        let opengauss_sql = opengauss_foreign_keys_sql();
+        assert!(!opengauss_sql.contains("WITH ORDINALITY"));
+        assert!(!opengauss_sql.contains("unnest"));
+        assert!(opengauss_sql.contains("con.conkey::text"));
+        assert!(opengauss_sql.contains("con.confkey::text"));
     }
 
     #[test]
