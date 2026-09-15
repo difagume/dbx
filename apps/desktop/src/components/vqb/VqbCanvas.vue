@@ -1,18 +1,31 @@
 <script setup lang="ts">
-import { computed, markRaw, ref, toRaw, watch } from "vue";
+import { computed, markRaw, onMounted, onUnmounted, ref, toRaw, watch } from "vue";
 import { VueFlow, type EdgeTypesObject, type NodeTypesObject } from "@vue-flow/core";
 import { Background } from "@vue-flow/background";
 import "@vue-flow/core/dist/style.css";
 import { computeLayoutWithLayers } from "@/lib/diagram/elk-layout";
+import { supportsExplainPlan } from "@/lib/diagram/explainPlan";
 import type { DiagramEdge, DiagramNode } from "@/types/diagram";
-import type { VqbOrderBy, VqbQueryModel } from "@/lib/vqb/model";
+import type { VqbDatabaseType, VqbDialect, VqbOrderBy, VqbQueryModel } from "@/lib/vqb/model";
+import { generateVqbSql } from "@/lib/vqb/sql";
+import { validateVqbModel } from "@/lib/vqb/validate";
+import { loadVqbDraft, saveVqbDraft } from "@/lib/vqb/storage";
+import { useQueryStore } from "@/stores/queryStore";
 import TableNode from "../diagram/TableNode.vue";
 import RelationshipEdge from "../diagram/RelationshipEdge.vue";
+import VqbPreview from "./VqbPreview.vue";
 import { VQB_JOIN_KIND, nextVqbAlias, suggestVqbJoin, vqbToFlowEdges, vqbToFlowNodes, type VqbSchemaTable } from "./vqbFlowMapper";
+
+const DRAFT_DEBOUNCE_MS = 300;
 
 const props = defineProps<{
   modelValue: VqbQueryModel;
   schemaTables?: VqbSchemaTable[];
+  connectionId?: string;
+  database?: string;
+  schema?: string;
+  databaseType?: VqbDatabaseType;
+  identifierQuote?: string;
 }>();
 
 const emit = defineEmits<{
@@ -28,6 +41,62 @@ const flowEdges = ref<ReturnType<typeof vqbToFlowEdges>>(vqbToFlowEdges(props.mo
 const orderDraft = ref({ columnKey: "", dir: "ASC" as VqbOrderBy["dir"] });
 
 const orderCandidates = computed(() => props.modelValue.tables.flatMap((table) => (schemaByName.value.get(table.name)?.columns ?? []).map((column) => ({ key: `${table.name}.${column.name}`, table: table.name, column: column.name }))));
+
+/** Live sync preview: pure computed from the model, zero backend roundtrips. */
+const vqbDialect = computed<VqbDialect>(() => {
+  const databaseType = props.databaseType ?? "postgres";
+  return { databaseType, identifierQuote: props.identifierQuote ?? (databaseType === "mysql" ? "`" : '"') };
+});
+const vqbValidation = computed(() => validateVqbModel(props.modelValue));
+const previewSql = computed<string | null>(() => {
+  try {
+    return generateVqbSql(props.modelValue, vqbDialect.value);
+  } catch {
+    return null;
+  }
+});
+const planSupported = computed(() => supportsExplainPlan(vqbDialect.value.databaseType));
+
+function hasDraftScope(): boolean {
+  return !!props.connectionId && !!props.database;
+}
+
+let draftTimer: ReturnType<typeof setTimeout> | undefined;
+function flushDraftSave(): void {
+  if (!hasDraftScope()) return;
+  saveVqbDraft(toRaw(props.modelValue), props.connectionId ?? "", props.database ?? "", props.schema ?? "");
+}
+function scheduleDraftSave(): void {
+  if (!hasDraftScope()) return;
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(flushDraftSave, DRAFT_DEBOUNCE_MS);
+}
+
+onMounted(() => {
+  if (!hasDraftScope()) return;
+  const draft = loadVqbDraft(props.connectionId ?? "", props.database ?? "", props.schema ?? "");
+  if (draft && props.modelValue.tables.length === 0 && props.modelValue.columns.length === 0) {
+    emit("update:modelValue", draft);
+  }
+});
+onUnmounted(() => {
+  if (draftTimer) clearTimeout(draftTimer);
+});
+watch(() => props.modelValue, scheduleDraftSave, { deep: true });
+
+function openInEditor(): void {
+  const sql = previewSql.value;
+  if (!sql || vqbValidation.value.errors.length > 0 || !hasDraftScope()) return;
+  useQueryStore().createTab(props.connectionId ?? "", props.database ?? "", "Visual query", "query", props.schema, sql, undefined, { forceNew: true });
+}
+
+async function runPreview(): Promise<void> {
+  const sql = previewSql.value;
+  if (!sql || vqbValidation.value.errors.length > 0 || !hasDraftScope()) return;
+  const store = useQueryStore();
+  const tabId = store.createTab(props.connectionId ?? "", props.database ?? "", "Visual query", "query", props.schema, sql, undefined, { forceNew: true });
+  await store.executeTabSql(tabId, sql);
+}
 
 const paletteTables = computed(() => {
   const onCanvas = new Set(props.modelValue.tables.map((table) => table.name));
@@ -161,7 +230,7 @@ function onCanvasDrop(event: DragEvent): void {
 
 watch(() => props.modelValue, syncFlow, { deep: true });
 
-defineExpose({ addTable, removeTable, toggleColumn, setColumnAlias, addOrderBy, removeOrderBy, setLimit, relayout });
+defineExpose({ addTable, removeTable, toggleColumn, setColumnAlias, addOrderBy, removeOrderBy, setLimit, relayout, openInEditor, runPreview, flushDraftSave });
 </script>
 
 <template>
@@ -242,6 +311,8 @@ defineExpose({ addTable, removeTable, toggleColumn, setColumnAlias, addOrderBy, 
           <input type="number" min="1" class="w-20 rounded border px-1" :value="props.modelValue.limit ?? ''" data-testid="vqb-limit" @input="setLimit(($event.target as HTMLInputElement).value)" />
         </label>
       </section>
+
+      <VqbPreview :sql="previewSql" :errors="vqbValidation.errors" :database-type="vqbDialect.databaseType" :plan-supported="planSupported" @open-in-editor="openInEditor" @run="runPreview" />
     </aside>
   </div>
 </template>
