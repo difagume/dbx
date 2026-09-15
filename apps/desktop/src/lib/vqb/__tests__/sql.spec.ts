@@ -78,6 +78,62 @@ describe("generateVqbSql", () => {
   });
 });
 
+describe("cross-dialect smoke (VQB-7…VQB-9, Phase 4)", () => {
+  function threeTableModel(): VqbQueryModel {
+    return {
+      tables: [
+        { name: "users", alias: "u" },
+        { name: "orders", alias: "o" },
+        { name: "items", alias: "i" },
+      ],
+      columns: [
+        { table: "users", name: "id" },
+        { table: "orders", name: "total", alias: "revenue" },
+        { table: "items", name: "sku" },
+      ],
+      joins: [
+        { left: { table: "users", column: "id" }, right: { table: "orders", column: "user_id" }, kind: "INNER" },
+        { left: { table: "orders", column: "id" }, right: { table: "items", column: "order_id" }, kind: "INNER" },
+      ],
+      where: [],
+      orderBy: [{ table: "items", column: "sku", dir: "ASC" }],
+      limit: 25,
+    };
+  }
+
+  it("doubles embedded backticks for MySQL", () => {
+    const model: VqbQueryModel = { ...singleTableModel(), tables: [{ name: "we`ird", alias: "w" }], columns: [{ table: "we`ird", name: "a`b" }] };
+    expect(generateVqbSql(model, MYSQL)).toBe("SELECT t1.`a``b` FROM `we``ird` AS t1;");
+  });
+
+  it("renders t1..t3 aliases plus double INNER JOIN ON per dialect (VQB-2)", () => {
+    const model = threeTableModel();
+    expect(generateVqbSql(model, PG)).toContain('FROM "users" AS t1 INNER JOIN "orders" AS t2 ON t1."id" = t2."user_id" INNER JOIN "items" AS t3 ON t2."id" = t3."order_id"');
+    expect(generateVqbSql(model, MYSQL)).toContain("FROM `users` AS t1 INNER JOIN `orders` AS t2 ON t1.`id` = t2.`user_id` INNER JOIN `items` AS t3 ON t2.`id` = t3.`order_id`");
+    expect(generateVqbSql(model, SQLITE)).toContain('FROM "users" AS t1 INNER JOIN "orders" AS t2 ON t1."id" = t2."user_id" INNER JOIN "items" AS t3 ON t2."id" = t3."order_id"');
+  });
+
+  it("renders identical LIMIT suffix on all dialects and rejects non-positive-integer limits", () => {
+    const model = threeTableModel();
+    for (const dialect of [PG, MYSQL, SQLITE]) expect(generateVqbSql(model, dialect)).toMatch(/ LIMIT 25;$/);
+    for (const bad of [0, -1, 1.5]) {
+      expect(validateVqbModel({ ...singleTableModel(), limit: bad }).errors.join(" ")).toMatch(/LIMIT must be a positive integer/i);
+    }
+  });
+
+  it("quotes column aliases per dialect (VQB-2)", () => {
+    const model: VqbQueryModel = { ...singleTableModel(), columns: [{ table: "users", name: "id", alias: "select" }] };
+    expect(generateVqbSql(model, PG)).toContain('AS "select"');
+    expect(generateVqbSql(model, MYSQL)).toContain("AS `select`");
+    expect(generateVqbSql(model, SQLITE)).toContain('AS "select"');
+  });
+
+  it("emits plain executable SELECT text on SQLite with no plan-tree markers (VQB-9)", () => {
+    const sql = generateVqbSql(joinedModel(), SQLITE);
+    expect(sql).toMatch(/^SELECT .*;$/);
+    expect(sql).not.toMatch(/EXPLAIN/i);
+  });
+});
 describe("validateVqbModel", () => {
   it("rejects an empty select (VQB-1)", () => {
     expect(validateVqbModel({ ...singleTableModel(), columns: [] }).errors.join(" ")).toMatch(/at least one column/i);
